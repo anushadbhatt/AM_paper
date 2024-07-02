@@ -1,0 +1,371 @@
+---
+title: "Neighborhood Analysis Code: Bhatt & Brown et al., 2024 - By Anusha Bhatt"
+output: html_document
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Load ggplot2 (Install if needed)
+```{r}
+#install.packages("ggplot2")
+library(ggplot2)
+```
+
+The following code is optimized to take up a csv file output from the tracking applet of ilastik and plot the import curves in figure 2 of Bhatt & Brown et al., 2024. It calculates the number of neighbors for a particular nucleus at its minimum and mid volumes and then compare the number of neighbors against the maximum achieved volume/intensity. It also calculates the initial slope of nuclear growth curve from first 5 minutes of nuclear import (This can be changed in the code, if needed).
+#All the additional features are listed as we progress.
+
+Specify all initial parameters (Sample values are provided)
+
+```{r}
+file_name<-read.csv("~/Documents/A&M Paper CSVs/Figure 2 Import curves/H3.3Shkl-NC13_230617S8.csv")#Enter the name of your dataset
+name<-"H3.3 Shkl NC13"#Enter the name you want to appear in the plot headings
+um<-20 #neighborhood radii in microns
+```
+Determine the minimum and maximum values of the z-filter using plot 1A
+```{r}
+#Plot 1A
+ggplot(data=file_name, aes(x=Object_Center_0,y=Object_Center_1, color=Object_Center_2))+geom_point(alpha=1/5)+scale_color_gradientn(colours = rainbow(7))
+```
+Input the z_filter values to avoid the edge nuclei
+```{r}
+z_filterM<-6 #Maximum Z, this is for filtering out the edge effects, changes for each of the datasets. Use plot 1A to aid in determining this value.
+z_filterm<-2 #Minimum Z
+```
+Calculate volumes, and determine minimum and maximum values of volume filter using plot 1B
+```{r}
+px<-0.149#pixel width/dimension to micron along x
+py<-0.149#pixel width/dimension to micron along y
+pz<-1.2#pixel width/dimension to micron along z
+file_name$Volume<-px*py*pz*file_name$Size_in_pixels_0
+file_name$Time<-file_name$frame*45/60
+#Plot1B
+ggplot(data=file_name[which(file_name$Object_Center_2<z_filterM & file_name$Object_Center_2>z_filterm),], aes(x=Time, y=Volume, color=Object_Center_1))+geom_line(aes(group=labelimageId), alpha=1/5)+geom_point(alpha=1/5)+scale_color_gradientn(colours = rainbow(7))
+```
+Input the volume filter values to reduce noise
+```{r}
+v<-25 # min Volume filter
+V<-420 # max Volume filter 
+remove<-as.numeric(levels(as.factor(file_name$trackId[file_name$Volume>V])))
+file_name<-file_name[which(file_name$Volume>v),]; #here, we are just filtering for the volume, to reduce the noise in the data.
+```
+
+Plot 1B also gives us an idea about how the cell cycle progresses along the A-P axis. Use the traces to determine and input the folllowing time filter values 
+```{r}
+frs<-2 #Enter frs value to shift the number of frames from min volume frame. Sometimes the first 4 points are at a plateau, and this could affect growth rate analysis.
+t_1<-10#a middle time value between tmin and tmax for filtering, for best results, give this a value closest to the earliest time point where the maximum nuclear size is achieved. Increase this value if you find nuclei missing in wavy Shkl embryos (smax$t4min<t1)
+t_2<-60#a max time value cutoff for filtering 
+t_3<-10#min time for Smax (smax$time>t_3), also used for filtering contamination of trackIds from previous cycles
+t_slp<-5#Applied on the phase matched initial timepoints we wish to include in slope calculation, particularly important for cycle 13 to avoid plateaus (default value of 5)
+```
+
+Specify matrices for max volume(Smax), mid volume (Emid) and min volume(Kmin) and then converting them to dataframes
+```{r}
+Smax<- data.frame (matrix(ncol = ncol(file_name), nrow = max(file_name$trackId)-1));
+colnames(Smax)<-colnames(file_name);
+Emid<- data.frame (matrix(ncol = ncol(file_name), nrow = max(file_name$trackId)-1));
+colnames(Emid)<-colnames(file_name);
+Kmin<- data.frame (matrix(ncol = ncol(file_name), nrow = max(file_name$trackId)-1));
+colnames(Kmin)<-colnames(file_name)
+```
+Now a matrix for nuclear growth rate and slope calculation
+```{r}
+Ngwth_Int<-data.frame (matrix(ncol = 5, nrow = max(file_name$trackId)-1));
+colnames(Ngwth_Int)<-c('trackID','Int1','Int2','Int3','Slope');
+```
+Filter trackIDs
+```{r}
+trackIDs<-as.numeric(unique(file_name$trackId));
+fil_trackIDs<-data.frame (matrix(ncol = 2, nrow = length(trackIDs))); #
+ti_count<-1;
+for(ti in trackIDs){
+  len<-length(file_name$trackId[file_name$trackId==ti]);
+  if(len>2){fil_trackIDs[ti_count,c(1,2)]<-c(ti,len);
+  ti_count<-ti_count+1}
+}
+trackIDs<-fil_trackIDs$X1[which(fil_trackIDs$X1>1)];
+trackIDs<-trackIDs[!trackIDs%in%remove]
+```
+Loop1: Here we are putting values in our Smax, Emid, Kmin and Ngwth matrices. 
+#Logic: It goes through all the trackIDs in the list, makes a subset of frames for each trackID. Then, for a given trackID, it identifies the max volume, and the frame at which it reaches the max volume (fr4max).
+#It then chops out all the frames following fr4max, and looks for a mid frame (fr4mid), calculates mid volume, and then min volume and identifies the min volume frame (fr4min).
+```{r, warning=FALSE}
+Mega_sif<-file_name[1:100,]
+a_count<-1
+sif_counter<-1
+for (a in trackIDs){
+  
+  sif<-file_name[file_name$trackId==a,];
+  if (length(sif$Time[sif$Time>t_3])>2){ 
+    M<-max(sif$Volume[which(sif$Time>t_3)]);### added a filter with t_3 here to avoid contamination from previous cycles
+    s<-sif[sif$Volume==M,];
+    fr4max<-sif$frame[which(sif$Volume==M)];
+    #sif_M<-sif[which(sif$frame>fr4max),]
+    sif<-sif[which(sif$frame<fr4max+1),]; #+1, because else it excludes fr4max, and when trackIDs with just one frame come in, it blocks the progression of the rest of the code
+    m<-min(sif$Volume);
+    fr4min<-sif$frame[which(sif$Volume==m)];
+    k<-sif[sif$Volume==m,];
+    sif<-sif[which(sif$frame>fr4min-1),]; #-1, because same reasons as +1
+    max_min_fr_avg<-round(median(sif$frame)); 
+    sif$temp_fr<-abs(sif$frame-max_min_fr_avg);
+    #sif_M$temp_fr<-abs(sif_M$frame-max_min_fr_avg);
+    fr4mid<-sif$frame[which(sif$temp_fr==min(sif$temp_fr))];
+    fr4mid<-fr4mid[1];
+    mid<-sif$Volume[which(sif$frame==fr4mid)];
+    e<-sif[which(sif$Volume==mid),];
+    sif$Time<-sif$Time-min(sif$Time); ###########Notice change. Use this to match the starting of nuclear growth curves
+    linear_model <- lm(Total_Intensity_0~Time, data=sif[which(sif$Time<t_slp),]);#restricting the slope calculation to initial few points 
+    #sif<-rbind(sif,sif_M)
+    Mega_sif[sif_counter:(sif_counter+length(sif$labelimageId)-1),]<-sif;
+    sif_counter<-sif_counter+length(sif$labelimageId);
+    Smax[a_count,]<-s;
+    Kmin[a_count,]<-k;
+    Emid[a_count,]<-e;
+    Ngwth_Int[a_count,]<-c(a,sif$Total_Intensity_0[1+frs],sif$Total_Intensity_0[2+frs],sif$Total_Intensity_0[3+frs],as.numeric(linear_model$coefficients[2])); #use as.numeric because as.integer only uses full values and converts floats/decimals into full values
+    a_count<-a_count+1}
+  
+}
+```
+filtering again for volume to reduce noise further
+```{r}
+Smax<-Smax[which(Smax$Volume>v),];
+Kmin<-Kmin[which(Kmin$Volume>v),];
+Smax<-Smax[which(Smax$trackId%in%Kmin$trackId),];
+Kmin<-Kmin[which(Kmin$trackId%in%Smax$trackId),];
+Emid<-Emid[which(Emid$Volume>v),];
+Emid<-Emid[which(Emid$trackId%in%Smax$trackId),];
+Ngwth_Int<-Ngwth_Int[which(Ngwth_Int$trackID%in%Smax$trackId),] #this chucks out all the noise that we removed from Smax in Ngwth as well 
+```
+
+Calculating number of neighbors at min and mid volumes. #logic: pick trackIDs from Smax, align and pick matching min volume nuclei, use their x,y,z positions to calculate neighbors at that time.
+#We make subsets for each nuclei's timepoint and calculate its neighbors.then, we count the number of nuclei within a said distance (d or D) and also calculate the average distance of nuclei within d/D
+```{r}
+#specifying matrices for calculations
+mat_1 <- matrix (, nrow=10000, ncol = 10000);
+Sub_1 <- matrix (, nrow=10000, ncol = 10000); 
+mat_2 <- matrix (, nrow=10000, ncol = 10000);
+Sub_2 <- matrix (, nrow=10000, ncol = 10000);  
+#first for loop begins here. 
+for (i in 1: nrow(Smax)) 
+{tID=Smax$trackId[i]
+#for min volumes first
+m4M<-Kmin[which(Kmin$trackId==tID),];
+xi<- px*as.numeric(m4M$Object_Center_0);
+yi<- py*as.numeric(m4M$Object_Center_1);
+zi<- pz*as.numeric(m4M$Object_Center_2);
+t=m4M$frame;
+su<-file_name[which(file_name$frame==t),]
+c<-1
+for (j in 1:nrow(su)){
+  xj<- px*as.numeric(su$Object_Center_0[j]);
+  yj<- py*as.numeric(su$Object_Center_1[j]);
+  zj<- pz*as.numeric(su$Object_Center_2[j])
+  d<- sqrt((xi-xj)^2 +(yi-yj)^2 +(zi-zj)^2);
+  mat_1[j,i] <- d;
+  if(d<um & d>1){
+    Sub_1[c,i]<-as.numeric(d);
+    c<- c+1;
+  }
+  
+}
+#Now for mid volumes, still within the first for loop 
+m4mid<-Emid[which(Emid$trackId==tID),];
+Xi<- px*as.numeric(m4mid$Object_Center_0);
+Yi<- py*as.numeric(m4mid$Object_Center_1);
+Zi<- pz*as.numeric(m4mid$Object_Center_2);
+t2=m4mid$frame;
+Su<-file_name[which(file_name$frame==t2),]
+C<-1
+for (j in 1:nrow(Su)){
+  Xj<- px*as.numeric(Su$Object_Center_0[j]);
+  Yj<- py*as.numeric(Su$Object_Center_1[j]);
+  Zj<- pz*as.numeric(Su$Object_Center_2[j])
+  D<- sqrt((Xi-Xj)^2 +(Yi-Yj)^2 +(Zi-Zj)^2);
+  mat_2[j,i] <- D;
+  if(D<um & D>1){
+    Sub_2[C,i]<-as.numeric(D);
+    C<- C+1;
+  }
+  
+}
+
+Sub_1<-as.data.frame(Sub_1); #converting into dataframe
+Sub_2<-as.data.frame(Sub_2);
+Smax$MeanDist_atMin[i]<-sum(Sub_1[,i],na.rm=TRUE)/(c-1); #Calculating mean distance
+Smax$MeanDist_atMid[i]<-sum(Sub_2[,i],na.rm=TRUE)/(C-1); #each of the individual distances are stored in a column, and sum of that/counter gives mean distance
+Smax$NumNeighbours_atMin[i]<-c-1; #and counter is essentially the number of neighbors
+Smax$NumNeighbours_atMid[i]<-C-1;
+Ngwth_Int$MeanDist_atMin[i]<-sum(Sub_1[,i],na.rm=TRUE)/(c-1); #putting these values in the Ngwth dataframe as well
+Ngwth_Int$MeanDist_atMid[i]<-sum(Sub_2[,i],na.rm=TRUE)/(C-1);
+Ngwth_Int$NumNeighbours_atMin[i]<-(c-1);
+Ngwth_Int$NumNeighbours_atMid[i]<-(C-1);
+Smax$t4min[i]<-t*45/60;
+Ngwth_Int$t4min[i]<-t*45/60;
+Smax$t4mid[i]<-t2*45/60;
+Ngwth_Int$t4mid[i]<-t2*45/60;
+}
+```
+#Additional dataset specific filters (marked with just #, change for each dataset accordingly)
+```{r}
+Smax<-Smax[which(Smax$t4min<t_1),] #
+Smax<-Smax[which(Smax$Time>t_3),] #
+Smax<-Smax[which(Smax$Time<t_2),] #
+Kmin<-Kmin[which(Kmin$trackId%in%Smax$trackId),]#
+Ngwth_Int<-Ngwth_Int[which(Ngwth_Int$trackID%in%Smax$trackId),];
+Ngwth_Int<-Ngwth_Int[which(Ngwth_Int$trackID%in%Kmin$trackId),];
+Mega_sif<-Mega_sif[which(Mega_sif$trackId%in%Smax$trackId),]
+```
+
+```{r}
+Ngwth_Int$Int1<-Ngwth_Int$Int1/mean(Mega_sif$Total_Intensity_0[which(Mega_sif$frame==max(Mega_sif$frame))]);
+Ngwth_Int$Int2<-Ngwth_Int$Int2/mean(Mega_sif$Total_Intensity_0[which(Mega_sif$frame==max(Mega_sif$frame))]);
+Ngwth_Int$Int3<-Ngwth_Int$Int3/mean(Mega_sif$Total_Intensity_0[which(Mega_sif$frame==max(Mega_sif$frame))]);
+Ngwth_Int$Slope<-Ngwth_Int$Slope/mean(Mega_sif$Total_Intensity_0[which(Mega_sif$frame==max(Mega_sif$frame))]);
+Mega_sif$NumNeighbours_atMin<-0
+Mega_sif$t4min<-0
+Mega_sif$NumNeighbours_atMid<-0
+Mega_sif$t4mid<-0
+for (num in Smax$trackId){
+  num1<-Smax$NumNeighbours_atMin[which(Smax$trackId==num)];
+  num2<-Smax$NumNeighbours_atMid[which(Smax$trackId==num)];
+  num3<-Smax$t4min[which(Smax$trackId==num)];
+  num4<-Smax$t4mid[which(Smax$trackId==num)];
+  Mega_sif$NumNeighbours_atMin[which(Mega_sif$trackId==num)]<-num1
+  Mega_sif$NumNeighbours_atMid[which(Mega_sif$trackId==num)]<-num2
+  Mega_sif$t4min[which(Mega_sif$trackId==num)]<-num3
+  Mega_sif$t4mid[which(Mega_sif$trackId==num)]<-num4}
+
+Mega_sif$AU<-Mega_sif$Total_Intensity_0/mean(Mega_sif$Total_Intensity_0[which(Mega_sif$frame==max(Mega_sif$frame))])
+```
+
+Try and remove the contaminating trackIDs from previous cycles
+```{r}
+remove_2<-Mega_sif$trackId[which(Mega_sif$Time==0 & Mega_sif$AU>mean(Mega_sif$AU))]
+Mega_sif<-Mega_sif[!Mega_sif$trackId %in% remove_2,]
+Smax<-Smax[!Smax$trackId %in% remove_2,]
+Kmin<-Kmin[which(Kmin$trackId%in%Smax$trackId),]#
+Ngwth_Int<-Ngwth_Int[which(Ngwth_Int$trackID%in%Smax$trackId),];
+```
+The traces have now been aligned to the same starting point, and colored according to their number of neighbors.
+Plot to visualize all the traces
+```{r}
+#Plot 2A
+ggplot(data=Mega_sif[which(Mega_sif$Object_Center_2<z_filterM & Mega_sif$Object_Center_2>z_filterm),], aes(x=Time, y=AU, color=NumNeighbours_atMin))+geom_line(aes(group=labelimageId), alpha=1/5)+geom_point(alpha=1/2)+scale_color_gradientn(colours = rainbow(7))+xlab("Time (mins)")+ylab("Total intensity (AU)")+ggtitle(paste("Nuclear import",name))+ labs(color="#neighbors@min")+theme(plot.title = element_text(hjust = 0.5))
+#Plot2B
+ggplot(data=Mega_sif[which(Mega_sif$Object_Center_2<z_filterM & Mega_sif$Object_Center_2>z_filterm),], aes(x=Time, y=AU, color=NumNeighbours_atMid))+geom_line(aes(group=labelimageId), alpha=1/5)+geom_point(alpha=1/2)+scale_color_gradientn(colours = rainbow(7))+xlab("Time (mins)")+ylab("Total intensity (AU)")+ggtitle(paste("Nuclear import",name))+ labs(color="#neighbors@mid")+theme(plot.title = element_text(hjust = 0.5))
+```
+Plotting some more parameters
+```{r}
+#Plot 3A: Total intensity vs no. of neighbors the nuclei had at min volume
+ggplot(data=Smax[which(Smax$Object_Center_2<z_filterM & Smax$Object_Center_2>z_filterm),], aes(y=Total_Intensity_0/mean(Mega_sif$Total_Intensity_0[which(Mega_sif$frame==max(Mega_sif$frame))]),x=NumNeighbours_atMin, color=trackId))+geom_point()+geom_smooth(method = "lm", se = FALSE)+xlab("#Neighbors at min")+ylab("Total intensity (AU)")+ggtitle(paste("Nuclear import",name))+theme(plot.title = element_text(hjust = 0.5))
+#Plot 3B: Total intensity vs no. of neighbors the nuclei had at mid volume
+ggplot(data=Smax[which(Smax$Object_Center_2<z_filterM & Smax$Object_Center_2>z_filterm),], aes(y=Total_Intensity_0/mean(Mega_sif$Total_Intensity_0[which(Mega_sif$frame==max(Mega_sif$frame))]),x=NumNeighbours_atMid, color=trackId))+geom_point()+geom_smooth(method = "lm", se = FALSE)+xlab("#Neighbors at mid")+ylab("Total intensity (AU)")+ggtitle(paste("Nuclear import",name))+theme(plot.title = element_text(hjust = 0.5))
+#Plot 3C: Nuclei postions in the embryo at max volume, colored by their no. of neighbors at min volume, and sized by volume
+ggplot(data=Smax[which(Smax$Object_Center_2<z_filterM & Smax$Object_Center_2>z_filterm & Smax$NumNeighbours_atMin>5),], aes(x=Object_Center_0,y=Object_Center_1, color=NumNeighbours_atMin, size=Volume))+geom_point()+scale_color_gradientn(colours = rainbow(7))
+#Plot 3D: Nuclei postions in the embryo at max volume, colored by their no. of neighbors at mid volume, and sized by volume
+ggplot(data=Smax[which(Smax$Object_Center_2<z_filterM & Smax$Object_Center_2>z_filterm),], aes(x=Object_Center_0,y=Object_Center_1, color=NumNeighbours_atMid, size=Volume))+geom_point()+scale_color_gradientn(colours = rainbow(7))
+```
+
+
+plotting nuclear growths from minimum volume to 4 points, calculating average nuclear growth and subsequently the slope for each neighborhood size.
+```{r}
+NatMin<-as.numeric(unique(Ngwth_Int$NumNeighbours_atMin))
+Avg_Ngwth_Int<-data.frame (matrix(ncol = 5, nrow = 3*length(NatMin)));
+colnames(Avg_Ngwth_Int)<-c('NumNeighbours_atMin','Avg_Int','Time', 'Avg_t4min','Slope');
+#In the following loop, the average volumes will be given out in a long form, this makes it easier for plotting in ggplot.
+k_count<-0
+for(k in NatMin)
+{k_sub<-Ngwth_Int[which(Ngwth_Int$NumNeighbours_atMin==k),];
+Avg_Ngwth_Int[1+(k_count*3),1:5]<-c(k,mean(k_sub$Int1,na.rm=TRUE),1,mean(k_sub$t4min,na.rm=TRUE),(mean(k_sub$Slope,na.rm=TRUE)));
+Avg_Ngwth_Int[2+(k_count*3),1:5]<-c(k,mean(k_sub$Int2,na.rm=TRUE),2,mean(k_sub$t4min,na.rm=TRUE),(mean(k_sub$Slope,na.rm=TRUE)));
+Avg_Ngwth_Int[3+(k_count*3),1:5]<-c(k,mean(k_sub$Int3,na.rm=TRUE),3,mean(k_sub$t4min,na.rm=TRUE),(mean(k_sub$Slope,na.rm=TRUE)));
+k_count<-k_count+1
+}
+
+Ngwth_Int_long<-data.frame (matrix(ncol = 5, nrow = 3*length(Ngwth_Int$trackID))); #converting the Ngwth dataframe into long form for easier plotting
+colnames(Ngwth_Int_long)<-c('trackID','NumNeighbours_atMin','Intensity','Time', 't4min');
+l_count<-0
+for(l in 1:length(Ngwth_Int$trackID))
+{Ngwth_Int_long[1+(l_count*3),1:5]<-c(Ngwth_Int$trackID[l],Ngwth_Int$NumNeighbours_atMin[l],Ngwth_Int$Int1[l],1,Ngwth_Int$t4min[l]);
+Ngwth_Int_long[2+(l_count*3),1:5]<-c(Ngwth_Int$trackID[l],Ngwth_Int$NumNeighbours_atMin[l],Ngwth_Int$Int2[l],2,Ngwth_Int$t4min[l]);
+Ngwth_Int_long[3+(l_count*3),1:5]<-c(Ngwth_Int$trackID[l],Ngwth_Int$NumNeighbours_atMin[l],Ngwth_Int$Int3[l],3,Ngwth_Int$t4min[l]);
+l_count<-l_count+1
+}
+
+#Plot 4A: Initial slopes of all nuclear growth curves-I (num of neighbors at min)
+ggplot(data=Ngwth_Int, aes(x=NumNeighbours_atMin, y=Slope, color=t4min))+geom_point(alpha=1/2)+scale_color_gradientn(colours = rainbow(7))+geom_smooth(method = "lm", se = FALSE)+ggtitle(paste("Nuclear import slopes", name))+ylim(0,0.25)+theme (plot.title = element_text(hjust = 0.5), text = element_text(size=20))
+#Plot 4B: Initial slopes of all nuclear growth curves-II (num of neighbors at mid)
+ggplot(data=Ngwth_Int, aes(x=NumNeighbours_atMid, y=Slope, color=t4mid))+geom_point(alpha=1/2)+scale_color_gradientn(colours = rainbow(7))+geom_smooth(method = "lm", se = FALSE)+ggtitle(paste("Nuclear import slopes", name))+ylim(0,0.25)+theme (plot.title = element_text(hjust = 0.5), text = element_text(size=20))
+```
+Binning the curves by the number of neighbors and coloring them accordingly (number of neighbors at minimum volume)
+```{r}
+M2S<-as.numeric(unique(Mega_sif$NumNeighbours_atMin))
+M2A<-data.frame (matrix(ncol = 5, nrow = length(M2S)*30)); #converting the Ngwth dataframe into long form for easier plotting
+colnames(M2A)<-c('NumNeighbours_atMin','Time', 'Mean AU', 'No. of points averaged','Mean Mean_Intensity_0');
+
+o_count<-1
+for(o in M2S)
+{o_sub<-Mega_sif[which(Mega_sif$NumNeighbours_atMin==o),];
+pep<-as.factor(o_sub$Time);
+half_max_pep<-0.5*max(summary(pep))*60/45;#to avoid lone points dictating the trends
+pep<-as.numeric(levels(pep));
+p_count<-0
+for(p in pep)
+{p_sub<-o_sub[which(o_sub$Time==p),];
+if (length(p_sub$frame)>5){#(used to be '>half_max_pep', replaced it with 5)
+  M2A[(o_count+p_count),1:5]<-c(o,p,mean(p_sub$AU,na.rm=TRUE),length(levels(as.factor(o_sub$trackId))),mean(p_sub$Mean_Intensity_0,na.rm=TRUE))
+  p_count<-p_count+1
+}}
+o_count<-o_count+p_count
+}
+M2A$Slope<-0;
+for (q in as.numeric(levels(as.factor(M2A$NumNeighbours_atMin))))#to avoid NA columns as well as to run the loop only once for each no. of neighbor
+{qip<-M2A[M2A$NumNeighbours_atMin==q,];
+Lin_mo<-lm(`Mean AU`~Time, data=qip[which(qip$Time<t_slp),]);
+M2A$Slope[M2A$NumNeighbours_atMin==q]<-as.numeric(Lin_mo$coefficients[2])}
+M2A<-M2A[which(M2A$NumNeighbours_atMin>0 & M2A$`No. of points averaged`>1),]
+#Plot 5A: Total intensity curves binned and colored for the set number of neighbors
+ggplot(data=M2A[which(M2A$NumNeighbours_atMin<50),], aes(x=Time, y=`Mean AU`/mean(Mega_sif$AU[which(Mega_sif$frame==max(Mega_sif$frame))]), color=NumNeighbours_atMin, size=`No. of points averaged`))+geom_line(aes(group=NumNeighbours_atMin), alpha=1/2)+geom_point(alpha=1)+scale_color_gradientn(colours = rainbow(7))+xlab("Time (mins)")+ylab("Total intensity (AU)")+ggtitle(paste("Nuclear import", name))+ labs(color="#neighbors@min")+theme (plot.title = element_text(hjust = 0.5), text = element_text(size=20))+ylim(0,1)
+#Plot 5B: Mean Intensity curves binned and colored for the set number of neighbors
+ggplot(data=M2A[which(M2A$NumNeighbours_atMin<50),], aes(x=Time, y=`Mean Mean_Intensity_0`/mean(Mega_sif$Mean_Intensity_0[which(Mega_sif$frame==max(Mega_sif$frame))]), color=NumNeighbours_atMin, size=`No. of points averaged`))+geom_line(aes(group=NumNeighbours_atMin), alpha=1/2)+geom_point(alpha=1)+scale_color_gradientn(colours = rainbow(7))+xlab("Time (mins)")+ylab("Mean intensity (AU)")+ggtitle(paste("Nuclear import", name))+ labs(color="#neighbors@min")+theme (plot.title = element_text(hjust = 0.5), text = element_text(size=20))
+
+```
+Binning the curves by the number of neighbors and coloring them accordingly (number of neighbors at mid volume)
+```{r}
+M2s<-as.factor(Mega_sif$NumNeighbours_atMid)
+M2s<-as.numeric(levels(M2s))
+M2a<-data.frame (matrix(ncol = 4, nrow = length(M2s)*30)); #converting the Ngwth dataframe into long form for easier plotting
+colnames(M2a)<-c('NumNeighbours_atMid','Time', 'Mean AU', 'No. of points averaged');
+
+o1_count<-1
+for(o1 in M2s)
+{o1_sub<-Mega_sif[which(Mega_sif$NumNeighbours_atMid==o1),];
+pep1<-as.factor(o1_sub$Time);
+half_max_pep1<-0.5*max(summary(pep1))*60/45;#to avoid lone points dictating the trends
+pep1<-as.numeric(levels(pep1));
+p1_count<-0
+for(p1 in pep1)
+{p1_sub<-o1_sub[which(o1_sub$Time==p1),];
+if (length(p1_sub$frame)>half_max_pep1){
+  M2a[(o1_count+p1_count),1:4]<-c(o1,p1,mean(p1_sub$AU,na.rm=TRUE),length(levels(as.factor(o1_sub$trackId))))
+  p1_count<-p1_count+1
+}}
+o1_count<-o1_count+p1_count
+}
+M2a$Slope<-0;
+for (q1 in as.numeric(levels(as.factor(M2a$NumNeighbours_atMid))))#to avoid NA columns as well as to run the loop only once for each no. of neighbor
+{Qip<-M2a[M2a$NumNeighbours_atMid==q1,];
+lin_mo<-lm(`Mean AU`~Time, data=Qip[which(Qip$Time<t_slp),]);
+M2a$Slope[M2a$NumNeighbours_atMid==q1]<-as.numeric(lin_mo$coefficients[2])}
+
+M2a<-M2a[which(M2a$NumNeighbours_atMid>0),]
+#Plot 6A: Total intensity curves binned and colored for the set number of neighbors
+ggplot(data=M2a[which(M2a$NumNeighbours_atMid<50),], aes(x=Time, y=`Mean AU`/mean(Mega_sif$AU[which(Mega_sif$frame==max(Mega_sif$frame))]), color=NumNeighbours_atMid, size=`No. of points averaged`))+geom_line(aes(group=NumNeighbours_atMid), alpha=1/2)+geom_point(alpha=1)+scale_color_gradientn(colours = rainbow(7))+xlab("Time (mins)")+ylab("Total intensity (AU)")+ggtitle(( paste("Nuclear import", name)))+ labs(color="#neighbors@mid")+theme (plot.title = element_text(hjust = 0.5), text = element_text(size=20))
+```
+Finally, rendering the final scaled plots used in the paper!!
+```{r}
+#1
+ggplot(data=Ngwth_Int[which(Ngwth_Int$NumNeighbours_atMin%in%M2A$NumNeighbours_atMin),], aes(x=NumNeighbours_atMin, y=Slope))+geom_point(size=3,alpha=1/2)+geom_smooth(method = "lm", se = FALSE)+ylim(0,0.2)+theme(text = element_text(size=20))+xlab("# Neighbors at min volume")+ylab("Initial slope")+scale_x_continuous(breaks = seq(5, 25, by = 5),limits = c(4.5,25.5))
+#2
+ggplot(data=M2A[which(M2A$NumNeighbours_atMin<50 & M2A$NumNeighbours_atMin>5),], aes(x=Time, y=`Mean AU`/mean(`Mean AU`[which(Time==Time[which(`Mean AU`==max(`Mean AU`))])]), color=NumNeighbours_atMin, size=`No. of points averaged`))+geom_line(aes(group=NumNeighbours_atMin), alpha=1/2)+geom_point(alpha=1)+scale_color_gradientn(colours = rainbow(7),limits=c(5,max(M2A$NumNeighbours_atMin)))+xlab("Time (mins)")+ylab("Total intensity (AU)")+ labs(color="# Neighbors", size="# Nuclei")+theme (plot.title = element_text(hjust = 0.5), text = element_text(size=20))+ylim(0,1.5)+scale_x_continuous(breaks = seq(0, 25, by = 5),limits = c(0,25.5))+guides(color = guide_colorbar(order = 1), size = guide_legend(order = 2))+scale_size_continuous(range = c(1, 5), breaks = c(20,40,60))
+```
+For any questions or comments, email anusha.d.bhatt.gr@dartmouth.edu.
